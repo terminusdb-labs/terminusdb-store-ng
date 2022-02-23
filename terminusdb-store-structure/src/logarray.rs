@@ -1,9 +1,9 @@
 use byteorder::{BigEndian, ByteOrder};
-use bytes::{Bytes,BytesMut, BufMut};
-use std::io;
+use bytes::{BufMut, Bytes, BytesMut};
+use std::cmp::Ordering;
 use std::error;
 use std::fmt;
-use std::cmp::Ordering;
+use std::io;
 use thiserror::Error;
 
 // Static assertion: We expect the system architecture bus width to be >= 32 bits. If it is not,
@@ -124,7 +124,10 @@ impl Iterator for LogArrayIterator {
 
 /// Read the length and bit width from the control word buffer. `buf` must start at the first word
 /// after the data buffer. `input_buf_size` is used for validation.
-fn read_and_validate_control_word(buf: &[u8], input_buf_size: usize) -> Result<(u32, u8), LogArrayError> {
+fn read_and_validate_control_word(
+    buf: &[u8],
+    input_buf_size: usize,
+) -> Result<(u32, u8), LogArrayError> {
     let (len, width) = read_control_word(buf)?;
     LogArrayError::validate_len_and_width(input_buf_size, len, width)?;
     Ok((len, width))
@@ -143,7 +146,8 @@ impl LogArray {
     pub fn parse(input_buf: Bytes) -> Result<LogArray, LogArrayError> {
         let input_buf_size = input_buf.len();
         LogArrayError::validate_input_buf_size(input_buf_size)?;
-        let (len, width) = read_and_validate_control_word(&input_buf[input_buf_size - 8..], input_buf_size)?;
+        let (len, width) =
+            read_and_validate_control_word(&input_buf[input_buf_size - 8..], input_buf_size)?;
         Ok(LogArray {
             len,
             width,
@@ -262,7 +266,7 @@ impl LogArray {
         LogArraySlice {
             original: self.clone(),
             offset: offset,
-            len: len
+            len: len,
         }
     }
 
@@ -310,7 +314,7 @@ impl LogArraySlice {
     }
 
     pub fn slice(&self, offset: usize, len: usize) -> LogArraySlice {
-        self.original.slice(self.offset as usize+offset, len)
+        self.original.slice(self.offset as usize + offset, len)
     }
 
     pub fn original(&self) -> &LogArray {
@@ -413,10 +417,7 @@ impl From<LogArray> for MonotonicLogArray {
 #[derive(Error, Debug, PartialEq)]
 pub enum LogArrayBuilderError {
     #[error("pushed number {number} is too large for width {width}")]
-    PushedNumberTooLargeForWidth {
-        number: u64,
-        width: u8
-    }
+    PushedNumberTooLargeForWidth { number: u64, width: u8 },
 }
 
 pub struct LogArrayBuilder {
@@ -428,18 +429,46 @@ pub struct LogArrayBuilder {
 
 impl LogArrayBuilder {
     pub fn new(width: u8) -> Self {
+        if width > 64 {
+            panic!("width too large: {}", width);
+        }
+
         Self {
             bytes: BytesMut::new(),
             width,
             current: 0,
-            len: 0
+            len: 0,
+        }
+    }
+
+    fn required_capacity(width: u8, len: usize) -> usize {
+        (1 + (len * width as usize + 63) / 64) * 8
+    }
+
+    pub fn with_capacity(width: u8, capacity: usize) -> Self {
+        if width > 64 {
+            panic!("width too large: {}", width);
+        }
+
+        if capacity > u32::MAX as usize {
+            panic!("requested capacity too large: {}", capacity);
+        }
+
+        Self {
+            bytes: BytesMut::with_capacity(Self::required_capacity(width, capacity)),
+            width,
+            current: 0,
+            len: 0,
         }
     }
 
     pub fn push(&mut self, number: u64) -> Result<(), LogArrayBuilderError> {
-        let leading_zeros = 64-(self.width as u32);
+        let leading_zeros = 64 - (self.width as u32);
         if number.leading_zeros() < leading_zeros {
-            return Err(LogArrayBuilderError::PushedNumberTooLargeForWidth{number, width: self.width});
+            return Err(LogArrayBuilderError::PushedNumberTooLargeForWidth {
+                number,
+                width: self.width,
+            });
         }
 
         let index_in_u64 = find_position_of_element(self.width, self.len);
@@ -448,7 +477,7 @@ impl LogArrayBuilder {
         if index_in_u64 as u32 > leading_zeros {
             self.bytes.put_u64(self.current);
 
-            self.current = number << (leading_zeros+index_in_u64 as u32);
+            self.current = number << (leading_zeros + index_in_u64 as u32);
         }
 
         self.len += 1;
@@ -457,10 +486,7 @@ impl LogArrayBuilder {
     }
 
     pub fn push_slice(&mut self, slice: &[u64]) -> Result<(), LogArrayBuilderError> {
-        let index_in_u64 = find_position_of_element(self.width, self.len);
-        let expansion = extra_u64s_taken_up(self.width, index_in_u64, slice.len());
-
-        self.bytes.reserve(expansion*8);
+        self.reserve(slice.len());
 
         for &element in slice.iter() {
             self.push(element)?;
@@ -469,12 +495,33 @@ impl LogArrayBuilder {
         Ok(())
     }
 
-    pub fn push_iter<I: Iterator<Item=u64>>(&mut self, iter: I) -> Result<(), LogArrayBuilderError> {
+    pub fn push_iter<I: Iterator<Item = u64>>(
+        &mut self,
+        iter: I,
+    ) -> Result<(), LogArrayBuilderError> {
         for element in iter {
             self.push(element)?;
         }
 
         Ok(())
+    }
+
+    pub fn capacity(&self) -> usize {
+        let capacity = self.bytes.capacity();
+        if capacity < 8 {
+            // not even enough for the control word.
+            return 0;
+        }
+
+        ((capacity - 8) * 8) / (self.width as usize)
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        let requested_capacity = self.len as usize + additional;
+        if requested_capacity > self.bytes.len() {
+            let required_capacity = Self::required_capacity(self.width, requested_capacity);
+            self.bytes.reserve(required_capacity - self.bytes.len());
+        }
     }
 
     pub fn finalize(mut self) -> Bytes {
@@ -485,7 +532,7 @@ impl LogArrayBuilder {
 
         self.bytes.put_u32(self.len);
         self.bytes.put_u8(self.width);
-        self.bytes.put([0,0,0].as_slice());
+        self.bytes.put([0, 0, 0].as_slice());
 
         self.bytes.into()
     }
@@ -496,17 +543,6 @@ fn find_position_of_element(width: u8, index: u32) -> u8 {
     let index_in_u64 = (bit_index & 0x3f) as u8;
 
     index_in_u64
-}
-
-fn extra_u64s_taken_up(width: u8, current_index_in_u64: u8, num_elements: usize) -> usize {
-    let remainder = (64 - current_index_in_u64) / width;
-    if remainder as usize >= num_elements {
-        return 0;
-    }
-
-    let u64s_taken_up = 1+(((num_elements-remainder as usize) * width as usize) >> 6);
-
-    u64s_taken_up
 }
 
 #[cfg(test)]
@@ -532,22 +568,22 @@ mod tests {
         verify_position_of_element(7, 10, 6);
     }
 
-    fn verify_u64s_taken_up(width: u8, current_index_in_u64: u8, num_elements: usize, expected_result: usize) {
-        let result = extra_u64s_taken_up(width, current_index_in_u64, num_elements);
-        assert_eq!((width, current_index_in_u64, num_elements, result),
-                   (width, current_index_in_u64, num_elements, expected_result));
+    fn verify_required_capacity(width: u8, num_elements: usize, expected_required_capacity: usize) {
+        let required_capacity = LogArrayBuilder::required_capacity(width, num_elements);
+        assert_eq!(
+            (width, num_elements, expected_required_capacity),
+            (width, num_elements, required_capacity)
+        );
     }
 
     #[test]
-    fn test_u64s_taken_up() {
-        verify_u64s_taken_up(7, 0, 9, 0);
-        verify_u64s_taken_up(7, 0, 10, 1);
-        verify_u64s_taken_up(7, 1, 9, 0);
-        verify_u64s_taken_up(7, 2, 9, 1);
-        verify_u64s_taken_up(7, 63, 0, 0);
-        verify_u64s_taken_up(7, 63, 1, 1);
-        verify_u64s_taken_up(7, 1, 18, 1);
-        verify_u64s_taken_up(7, 2, 18, 2);
+    fn test_required_capacity() {
+        verify_required_capacity(7, 0, 8);
+        verify_required_capacity(7, 1, 16);
+        verify_required_capacity(7, 9, 16);
+        verify_required_capacity(7, 10, 24);
+        verify_required_capacity(7, 18, 24);
+        verify_required_capacity(7, 19, 32);
     }
 
     #[test]
@@ -642,13 +678,21 @@ mod tests {
     fn log_array_file_builder_error() {
         let mut builder = LogArrayBuilder::new(3);
         let err = builder.push(8).unwrap_err();
-        assert_eq!(LogArrayBuilderError::PushedNumberTooLargeForWidth{number:8, width:3}, err);
+        assert_eq!(
+            LogArrayBuilderError::PushedNumberTooLargeForWidth {
+                number: 8,
+                width: 3
+            },
+            err
+        );
     }
 
     #[test]
     fn generate_then_parse_works() {
         let mut builder = LogArrayBuilder::new(5);
-        builder.push_slice([1, 3, 2, 5, 12, 31, 18].as_slice()).unwrap();
+        builder
+            .push_slice([1, 3, 2, 5, 12, 31, 18].as_slice())
+            .unwrap();
         let bytes = builder.finalize();
         let logarray = LogArray::parse(bytes).unwrap();
 
@@ -729,21 +773,23 @@ mod tests {
     #[test]
     fn test_slice() {
         let mut builder = LogArrayBuilder::new(5);
-        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        builder
+            .push_slice([2, 0, 3, 8, 5, 9, 12].as_slice())
+            .unwrap();
         let bytes = builder.finalize();
         let logarray = LogArray::parse(bytes).unwrap();
 
-        let slice = logarray.slice(2,4);
+        let slice = logarray.slice(2, 4);
         assert_eq!(4, slice.len());
-        assert_eq!(vec![3,8,5,9], slice.iter().collect::<Vec<_>>());
+        assert_eq!(vec![3, 8, 5, 9], slice.iter().collect::<Vec<_>>());
         assert_eq!(3, slice.entry(0));
         assert_eq!(8, slice.entry(1));
         assert_eq!(5, slice.entry(2));
         assert_eq!(9, slice.entry(3));
 
-        let slice2 = slice.slice(1,2);
+        let slice2 = slice.slice(1, 2);
         assert_eq!(2, slice2.len());
-        assert_eq!(vec![8,5], slice2.iter().collect::<Vec<_>>());
+        assert_eq!(vec![8, 5], slice2.iter().collect::<Vec<_>>());
         assert_eq!(8, slice2.entry(0));
         assert_eq!(5, slice2.entry(1));
     }
@@ -752,33 +798,80 @@ mod tests {
     #[should_panic(expected = "expected slice offset (8) + length (10) <= source length (7)")]
     fn slice_start_out_of_bounds_should_panic() {
         let mut builder = LogArrayBuilder::new(5);
-        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        builder
+            .push_slice([2, 0, 3, 8, 5, 9, 12].as_slice())
+            .unwrap();
         let bytes = builder.finalize();
         let logarray = LogArray::parse(bytes).unwrap();
 
-        let _slice = logarray.slice(8,10);
+        let _slice = logarray.slice(8, 10);
     }
 
     #[test]
     #[should_panic(expected = "expected slice offset (4) + length (10) <= source length (7)")]
     fn slice_end_out_of_bounds_should_panic() {
         let mut builder = LogArrayBuilder::new(5);
-        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        builder
+            .push_slice([2, 0, 3, 8, 5, 9, 12].as_slice())
+            .unwrap();
         let bytes = builder.finalize();
         let logarray = LogArray::parse(bytes).unwrap();
 
-        let _slice = logarray.slice(4,10);
+        let _slice = logarray.slice(4, 10);
     }
 
     #[test]
     fn empty_slice() {
         let mut builder = LogArrayBuilder::new(5);
-        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        builder
+            .push_slice([2, 0, 3, 8, 5, 9, 12].as_slice())
+            .unwrap();
         let bytes = builder.finalize();
         let logarray = LogArray::parse(bytes).unwrap();
 
-        let slice = logarray.slice(4,0);
+        let slice = logarray.slice(4, 0);
         assert!(slice.is_empty());
         assert_eq!(0, slice.len());
+    }
+
+    fn verify_builder_capacity(
+        width: u8,
+        len: usize,
+        expected_bytes_capacity: usize,
+        expected_capacity: usize,
+    ) {
+        let builder = LogArrayBuilder::with_capacity(width, len);
+
+        assert_eq!(
+            (width, len, expected_bytes_capacity, expected_capacity),
+            (width, len, builder.bytes.capacity(), builder.capacity())
+        );
+    }
+
+    #[test]
+    fn reserve_builder_capacity() {
+        verify_builder_capacity(1, 0, 8, 0);
+        verify_builder_capacity(1, 1, 16, 64);
+        verify_builder_capacity(1, 64, 16, 64);
+        verify_builder_capacity(1, 65, 24, 128);
+        verify_builder_capacity(2, 32, 16, 32);
+        verify_builder_capacity(2, 33, 24, 64);
+        verify_builder_capacity(3, 21, 16, 21);
+        verify_builder_capacity(3, 22, 24, 42);
+        verify_builder_capacity(3, 43, 32, 64);
+    }
+
+    #[test]
+    fn reserve_builder_extra_unnecessary_capacity() {
+        let mut builder = LogArrayBuilder::with_capacity(3, 21);
+        builder.reserve(9);
+        assert_eq!(21, builder.capacity());
+    }
+
+    #[test]
+    fn reserve_builder_extra_necessary_capacity() {
+        let mut builder = LogArrayBuilder::with_capacity(3, 21);
+        builder.reserve(22);
+        assert!(builder.capacity() >= 42);
     }
 }
