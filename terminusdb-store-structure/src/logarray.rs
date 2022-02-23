@@ -13,12 +13,6 @@ const _: usize = 0 - !(std::mem::size_of::<usize>() >= 32 >> 3) as usize;
 /// An in-memory log array
 #[derive(Clone)]
 pub struct LogArray {
-    /// Index of the first accessible element
-    ///
-    /// For an original log array, this is initialized to 0. For a slice, this is the index to the
-    /// first element of the slice.
-    first: u32,
-
     /// Number of accessible elements
     ///
     /// For an original log array, this is initialized to the value read from the control word. For
@@ -151,7 +145,6 @@ impl LogArray {
         LogArrayError::validate_input_buf_size(input_buf_size)?;
         let (len, width) = read_and_validate_control_word(&input_buf[input_buf_size - 8..], input_buf_size)?;
         Ok(LogArray {
-            first: 0,
             len,
             width,
             input_buf,
@@ -186,7 +179,7 @@ impl LogArray {
         );
 
         // `usize::try_from` succeeds if `std::mem::size_of::<usize>()` >= 4.
-        let bit_index = usize::from(self.width) * (usize::try_from(self.first).unwrap() + index);
+        let bit_index = (self.width as usize) * index;
 
         // Read the words that contain the element.
         let (first_word, second_word) = {
@@ -250,7 +243,7 @@ impl LogArray {
     /// Returns a logical slice of the elements in a log array.
     ///
     /// Panics if `index` + `length` is >= the length of the log array.
-    pub fn slice(&self, offset: usize, len: usize) -> LogArray {
+    pub fn slice(&self, offset: usize, len: usize) -> LogArraySlice {
         let offset = u32::try_from(offset)
             .unwrap_or_else(|_| panic!("expected 32-bit slice offset ({})", offset));
         let len =
@@ -265,12 +258,67 @@ impl LogArray {
             len,
             self.len
         );
-        LogArray {
-            first: self.first + offset,
-            len,
-            width: self.width,
-            input_buf: self.input_buf.clone(),
+
+        LogArraySlice {
+            original: self.clone(),
+            offset: offset,
+            len: len
         }
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        &self.input_buf
+    }
+}
+
+pub struct LogArraySlice {
+    original: LogArray,
+    offset: u32,
+    len: u32,
+}
+
+impl LogArraySlice {
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn width(&self) -> u8 {
+        self.original.width()
+    }
+
+    pub fn entry(&self, index: usize) -> u64 {
+        assert!(
+            index < self.len(),
+            "expected index ({}) < length ({})",
+            index,
+            self.len
+        );
+
+        self.original.entry(self.offset as usize + index)
+    }
+
+    pub fn iter(&self) -> LogArrayIterator {
+        LogArrayIterator {
+            logarray: self.original.clone(),
+            pos: self.offset as usize,
+            end: (self.offset + self.len) as usize,
+        }
+    }
+
+    pub fn slice(&self, offset: usize, len: usize) -> LogArraySlice {
+        self.original.slice(self.offset as usize+offset, len)
+    }
+
+    pub fn original(&self) -> &LogArray {
+        &self.original
+    }
+
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 }
 
@@ -349,6 +397,10 @@ impl MonotonicLogArray {
         }
 
         (min + max) / 2 + 1
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        self.0.bytes()
     }
 }
 
@@ -620,16 +672,6 @@ mod tests {
         0b00000000,
     ];
     const TEST0_CONTROL: [u8; 8] = [0, 0, 0, 3, 17, 0, 0, 0];
-    const TEST1_DATA: [u8; 8] = [
-        0b0100_0000,
-        0b00000000,
-        0b00101_000,
-        0b00000000,
-        0b000110_00,
-        0b00000000,
-        0b0000111_0,
-        0b00000000,
-    ];
 
     fn test0_logarray() -> LogArray {
         let mut content = Vec::new();
@@ -682,5 +724,61 @@ mod tests {
     fn monotonic_panic() {
         let content = [0u8, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2, 32, 0, 0, 0].as_ref();
         MonotonicLogArray::from_logarray(LogArray::parse(Bytes::from(content)).unwrap());
+    }
+
+    #[test]
+    fn test_slice() {
+        let mut builder = LogArrayBuilder::new(5);
+        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        let bytes = builder.finalize();
+        let logarray = LogArray::parse(bytes).unwrap();
+
+        let slice = logarray.slice(2,4);
+        assert_eq!(4, slice.len());
+        assert_eq!(vec![3,8,5,9], slice.iter().collect::<Vec<_>>());
+        assert_eq!(3, slice.entry(0));
+        assert_eq!(8, slice.entry(1));
+        assert_eq!(5, slice.entry(2));
+        assert_eq!(9, slice.entry(3));
+
+        let slice2 = slice.slice(1,2);
+        assert_eq!(2, slice2.len());
+        assert_eq!(vec![8,5], slice2.iter().collect::<Vec<_>>());
+        assert_eq!(8, slice2.entry(0));
+        assert_eq!(5, slice2.entry(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected slice offset (8) + length (10) <= source length (7)")]
+    fn slice_start_out_of_bounds_should_panic() {
+        let mut builder = LogArrayBuilder::new(5);
+        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        let bytes = builder.finalize();
+        let logarray = LogArray::parse(bytes).unwrap();
+
+        let _slice = logarray.slice(8,10);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected slice offset (4) + length (10) <= source length (7)")]
+    fn slice_end_out_of_bounds_should_panic() {
+        let mut builder = LogArrayBuilder::new(5);
+        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        let bytes = builder.finalize();
+        let logarray = LogArray::parse(bytes).unwrap();
+
+        let _slice = logarray.slice(4,10);
+    }
+
+    #[test]
+    fn empty_slice() {
+        let mut builder = LogArrayBuilder::new(5);
+        builder.push_slice([2,0,3,8,5,9,12].as_slice()).unwrap();
+        let bytes = builder.finalize();
+        let logarray = LogArray::parse(bytes).unwrap();
+
+        let slice = logarray.slice(4,0);
+        assert!(slice.is_empty());
+        assert_eq!(0, slice.len());
     }
 }
