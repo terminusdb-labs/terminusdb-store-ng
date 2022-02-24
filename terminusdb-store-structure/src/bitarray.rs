@@ -1,4 +1,4 @@
-use byteorder::{BigEndian, ByteOrder};
+use byteorder::{BigEndian, ByteOrder, NativeEndian};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::error;
 use std::fmt;
@@ -170,13 +170,21 @@ impl BitArray {
             );
         }
 
-        let mut count = 0;
+        let blocks = index / 64;
 
-        for elt in self.iter().take(index + 1) {
-            if !elt {
-                count += 1;
-            }
+        let mut count: usize = 0;
+        for i in 0..blocks {
+            let block = NativeEndian::read_u64(&self.buf[i * 8..(i + 1) * 8]);
+            count += block.count_zeros() as usize;
         }
+
+        let remainder = index % 64;
+        let mut final_block = BigEndian::read_u64(&self.buf[blocks * 8..(blocks + 1) * 8]);
+        if remainder != 63 {
+            let mask = u64::MAX >> remainder + 1;
+            final_block |= mask;
+        }
+        count += final_block.count_zeros() as usize;
 
         count
     }
@@ -189,13 +197,19 @@ impl BitArray {
                 self.len()
             );
         }
-        let mut count = 0;
 
-        for elt in self.iter().take(index + 1) {
-            if elt {
-                count += 1;
-            }
+        let blocks = index / 64;
+
+        let mut count: usize = 0;
+        for i in 0..blocks {
+            let block = NativeEndian::read_u64(&self.buf[i * 8..(i + 1) * 8]);
+            count += block.count_ones() as usize;
         }
+
+        let remainder = index % 64;
+        let final_block =
+            BigEndian::read_u64(&self.buf[blocks * 8..(blocks + 1) * 8]) >> (63 - remainder);
+        count += final_block.count_ones() as usize;
 
         count
     }
@@ -209,16 +223,44 @@ impl BitArray {
             }
         }
 
-        for (index, elt) in self.iter().enumerate() {
-            if !elt {
-                rank -= 1;
-                if rank == 0 {
-                    return Some(index);
-                }
+        let max_block = (self.len() + 63) / 64;
+        let mut found_index = None;
+        for i in 0..max_block {
+            let block = NativeEndian::read_u64(&self.buf[i * 8..(i + 1) * 8]);
+            let count = block.count_zeros() as usize;
+            if count >= rank {
+                found_index = Some(i);
+                break;
+            } else {
+                rank -= count;
             }
         }
 
-        None
+        if let Some(found) = found_index {
+            let block = BigEndian::read_u64(&self.buf[found * 8..(found + 1) * 8]);
+            let mut mask = 0x8000000000000000;
+
+            for i in 0..64 {
+                if block & mask == 0 {
+                    rank -= 1;
+
+                    if rank == 0 {
+                        let result = found * 64 + i;
+                        if result >= self.len() {
+                            return None;
+                        } else {
+                            return Some(result);
+                        }
+                    }
+                }
+
+                mask >>= 1;
+            }
+
+            None
+        } else {
+            None
+        }
     }
 
     pub fn select1(&self, mut rank: usize) -> Option<usize> {
@@ -230,16 +272,44 @@ impl BitArray {
             }
         }
 
-        for (index, elt) in self.iter().enumerate() {
-            if elt {
-                rank -= 1;
-                if rank == 0 {
-                    return Some(index);
-                }
+        let max_block = (self.len() + 63) / 64;
+        let mut found_index = None;
+        for i in 0..max_block {
+            let block = NativeEndian::read_u64(&self.buf[i * 8..(i + 1) * 8]);
+            let count = block.count_ones() as usize;
+            if count >= rank {
+                found_index = Some(i);
+                break;
+            } else {
+                rank -= count;
             }
         }
 
-        None
+        if let Some(found) = found_index {
+            let block = BigEndian::read_u64(&self.buf[found * 8..(found + 1) * 8]);
+            let mut mask = 0x8000000000000000;
+
+            for i in 0..64 {
+                if block & mask != 0 {
+                    rank -= 1;
+
+                    if rank == 0 {
+                        let result = found * 64 + i;
+                        if result >= self.len() {
+                            return None;
+                        } else {
+                            return Some(result);
+                        }
+                    }
+                }
+
+                mask >>= 1;
+            }
+
+            None
+        } else {
+            None
+        }
     }
 }
 
