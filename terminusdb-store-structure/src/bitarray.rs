@@ -161,7 +161,7 @@ impl BitArray {
         BitArrayIterator::new(self.clone())
     }
 
-    pub fn rank0(&self, mut index: usize) -> usize {
+    pub fn rank0(&self, index: usize) -> usize {
         if index >= self.len() {
             panic!(
                 "index {} out of range for bitarray with length {}",
@@ -170,23 +170,18 @@ impl BitArray {
             );
         }
 
-        let mut it = self.iter();
         let mut count = 0;
-        loop {
-            let elt = it.next().unwrap();
 
+        for elt in self.iter().take(index + 1) {
             if !elt {
                 count += 1;
             }
-
-            if index == 0 {
-                return count;
-            }
-            index -= 1;
         }
+
+        count
     }
 
-    pub fn rank1(&self, mut index: usize) -> usize {
+    pub fn rank1(&self, index: usize) -> usize {
         if index >= self.len() {
             panic!(
                 "index {} out of range for bitarray with length {}",
@@ -194,20 +189,15 @@ impl BitArray {
                 self.len()
             );
         }
-        let mut it = self.iter();
         let mut count = 0;
-        loop {
-            let elt = it.next().unwrap();
 
+        for elt in self.iter().take(index + 1) {
             if elt {
                 count += 1;
             }
-
-            if index == 0 {
-                return count;
-            }
-            index -= 1;
         }
+
+        count
     }
 
     pub fn select0(&self, mut rank: usize) -> Option<usize> {
